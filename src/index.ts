@@ -3,6 +3,7 @@ import Puppeteer from 'koishi-plugin-puppeteer'
 import { promises as fs } from 'fs'
 import { resolve, join, extname } from 'path'
 import { createHash, randomUUID } from 'crypto'
+import { tmpdir } from 'os'
 import { Scraper, SearchMode, type Tweet } from '@the-convocation/twitter-scraper'
 import type {} from '@koishijs/plugin-console'
 
@@ -41,6 +42,9 @@ interface BaseConfig {
   sendMedia: boolean
   downloadOriginalImage: boolean
   cookie: string
+  isProxy: boolean
+  proxyHost: string
+  proxyApi: boolean
   useForward: boolean
   silentParsing: boolean
   separateMediaSend: boolean
@@ -49,6 +53,8 @@ interface BaseConfig {
   apiProvider: ApiProvider
   gifMode: GifMode
   tempPath: string
+  maxVideoMB: number
+  skipVideo: boolean
   imageTransferMode: FileTransferMode
   videoTransferMode: FileTransferMode
   sub_showLink: boolean
@@ -98,7 +104,18 @@ type TweetData = {
 
 type ProcessedTweet = {
   main?: string | h
+  fallbackText?: string | h
+  droppedMediaCount?: number
   media: h[]
+}
+
+type PageProvider = {
+  page(): Promise<any>
+}
+
+type TranslationResult = {
+  text: string
+  source: 'translator' | 'chatluna' | 'google'
 }
 
 type HashtagSubscription = {
@@ -184,6 +201,9 @@ export const Config: Schema<Config> = Schema.intersect([
     sendMedia: Schema.boolean().description('是否发送推文中的图片和视频。').default(true),
     downloadOriginalImage: Schema.boolean().description('是否下载原图（最高画质）。API 与浏览器媒体获取都会尽量使用 Twitter 原图参数。').default(false),
     cookie: Schema.string().role('textarea').description('Twitter/X 登录 Cookie(auth_token).'),
+    isProxy: Schema.boolean().description('是否使用代理（只影响本插件）。浏览器抓取与媒体下载会经由代理。').default(false),
+    proxyHost: Schema.string().description('代理服务器地址，形如 http://账号:密码@主机:端口。').default('http://127.0.0.1:7890'),
+    proxyApi: Schema.boolean().description('API 请求（vxtwitter/fxtwitter）是否也走代理。默认关闭：国内可直连且更快。').default(false),
     useForward: Schema.boolean().description('是否使用合并转发的形式发送(仅 QQ 平台效果最佳).').default(false),
     silentParsing: Schema.boolean().description('是否关闭解析时的加载提示。').default(false),
   }).description('解析设置 - 当手动发送链接时生效'),
@@ -221,6 +241,8 @@ export const Config: Schema<Config> = Schema.intersect([
       Schema.const('realGif').description('转为真 GIF'),
     ]).role('radio').description('Twitter 动图处理方式。realGif 需要启用 koishi-plugin-ffmpeg 服务，体积和耗时都会增加。').default('video'),
     tempPath: Schema.string().description('临时文件目录。相对于 Koishi 工作目录。file 模式和 realGif 转换会使用此目录。').default('data/temp/twitter-fetcher'),
+    maxVideoMB: Schema.number().description('视频体积上限（MB）。先探测大小，超过则跳过该视频，避免代理下载慢导致发送超时。0 表示不限制。').default(40).min(0),
+    skipVideo: Schema.boolean().description('完全跳过推文中的视频。大视频会以 base64 经 WebSocket 传给 NapCat，可能把 NapCat 卡死，建议保持开启。').default(false),
   }).description('文件发送设置'),
 
   Schema.object({
@@ -375,13 +397,25 @@ function inferMediaType(url: string, fallback: MediaType = 'image'): MediaType {
   return fallback
 }
 
+const MEDIA_NOISE = /profile_images|profile_banners|\/emoji\/|hashflags|card_img|abs\.twimg\.com/i
+
+function getVideoId(url: string) {
+  const m = url.match(/(?:amplify_video_thumb|ext_tw_video_thumb|amplify_video|ext_tw_video|tweet_video_thumb)\/(\d+)/i)
+  return m ? m[1] : null
+}
+
 function getMediaKey(url: string) {
   try {
     const parsed = new URL(url)
+    // 头像、横幅、emoji、hashflag 等都不是推文媒体，直接丢弃
+    if (MEDIA_NOISE.test(parsed.pathname)) return ''
     if (parsed.hostname.endsWith('pbs.twimg.com') && parsed.pathname.includes('/media/')) {
       const path = parsed.pathname.replace(/\.(jpg|jpeg|png|webp|gif)$/i, '')
       return (parsed.origin + path).toLowerCase()
     }
+    // 视频封面图与真实视频统一归一到 video:<id>，避免同一视频被当成两个媒体
+    const vid = getVideoId(parsed.pathname)
+    if (vid) return `video:${vid}`
     if (parsed.hostname.endsWith('video.twimg.com')) return (parsed.origin + parsed.pathname).toLowerCase()
     return (parsed.origin + parsed.pathname + parsed.search).toLowerCase()
   } catch {
@@ -424,6 +458,278 @@ function fileUrl(path: string) {
 
 async function ensureDir(path: string) {
   await fs.mkdir(path, { recursive: true })
+}
+
+function proxyHttpOptions(proxyUrl?: string) {
+  return proxyUrl ? { proxyAgent: proxyUrl } : {}
+}
+
+function gotoPage(page: any, url: string, timeout: number) {
+  return page.goto(url, { waitUntil: 'domcontentloaded', timeout })
+}
+
+/**
+ * 加载推文页面：domcontentloaded + 等待第一条“非置顶”推文。
+ * 经代理访问 x.com 时首条推文平均要 19–28s 才出现，原 20s 超时必然失败；
+ * 且原实现等到任意 article 即返回，而首条往往是“已置顶”，提取逻辑又会跳过置顶，
+ * 于是“等到了却提取不到”，报“未能找到任何符合条件的推文链接”。
+ */
+async function loadTweetPage(
+  page: any,
+  url: string,
+  opts: { waitMs?: number, gotoMs?: number, maxAttempts?: number, log?: (message: string, isWarning?: boolean) => void } = {},
+) {
+  const waitMs = opts.waitMs || 50000
+  const gotoMs = opts.gotoMs || 45000
+  const maxAttempts = opts.maxAttempts || 3
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      if (attempt === 1) await gotoPage(page, url, gotoMs)
+      else await page.reload({ waitUntil: 'domcontentloaded', timeout: gotoMs })
+    } catch (error) {
+      if (attempt === maxAttempts) throw error
+      continue
+    }
+    try {
+      await page.evaluate(() => void 0)
+      await page.waitForFunction(() => {
+        const arts = document.querySelectorAll('article[data-testid="tweet"]')
+        for (const a of arts) {
+          const sc = a.querySelector('[data-testid="socialContext"]')
+          const t = sc ? sc.textContent || '' : ''
+          if (!/(pinned|已置顶|置顶|固定|置頂)/i.test(t)) return true
+        }
+        return false
+      }, { timeout: waitMs })
+      return true
+    } catch (error) {
+      const message = (error && (error as Error).message) || ''
+      // closed/detached/Target 类错误说明页面已不可用，重试无意义
+      if (message.includes('closed') || message.includes('detached') || message.includes('Target')) throw error
+      opts.log?.(`第 ${attempt} 次未加载出推文元素，重试中...`, true)
+    }
+  }
+  return false
+}
+
+function pickAuth(auth: { username: string, password: string } | null) {
+  return auth ? { username: auth.username, password: auth.password } : null
+}
+
+/**
+ * 加载可选依赖：用变量 id 调用 require，让打包器不做静态解析（这些包打在发布副本里是可选运行时依赖）。
+ */
+function loadOptionalModule(id: string): any {
+  try {
+    if (typeof require !== 'function') return null
+    return require(id)
+  } catch {
+    return null
+  }
+}
+
+const BROWSER_IDLE_MS = 5 * Time.minute
+const BROWSER_MAX_PAGES = 1
+
+/**
+ * 按需启动的独立浏览器实例：只给本插件用，不碰共享的 ctx.puppeteer。
+ * 懒启动、空闲 5 分钟自动关闭（该机内存仅 1.6 GB），所有定时器 unref()。
+ */
+class BrowserManager {
+  browser: any = null
+  pending: Promise<any> | null = null
+  idleTimer: NodeJS.Timeout | null = null
+  pageCount = 0
+  activePages = 0
+  pageQueue: { resolve: () => void, reject: (error: Error) => void }[] = []
+  gcTimer: NodeJS.Timeout | null = null
+  auth: { username: string, password: string } | null
+  proxyUrl: string
+  log?: (message: string, isWarning?: boolean) => void
+
+  constructor(proxyUrl: string, auth: { username: string, password: string } | null, log?: (message: string, isWarning?: boolean) => void) {
+    this.proxyUrl = proxyUrl || ''
+    this.auth = pickAuth(auth)
+    this.log = log
+  }
+
+  urlWithoutAuth() {
+    try {
+      const u = new URL(this.proxyUrl)
+      return `${u.protocol}//${u.host}`
+    } catch {
+      return this.proxyUrl.replace(/^([a-zA-Z][\w+.-]*:\/\/)[^@/]*@/, '$1')
+    }
+  }
+
+  async launch(): Promise<any> {
+    const puppeteerCore = loadOptionalModule('puppeteer-core') || loadOptionalModule('puppeteer')
+    if (!puppeteerCore) {
+      throw new Error('无法加载 puppeteer-core，代理浏览器不可用')
+    }
+    const findChrome = loadOptionalModule('puppeteer-finder')
+    const proxyServer = this.urlWithoutAuth()
+    const args: string[] = ['--disable-dev-shm-usage']
+    if (process.getuid && process.getuid() === 0) args.push('--no-sandbox')
+    if (proxyServer) args.push(`--proxy-server=${proxyServer}`)
+    // 代理为 HTTPS(自签证书) 时必须跳过 Chromium 的证书校验，否则在“到代理”的 TLS 握手阶段就失败
+    if (proxyServer && proxyServer.startsWith('https:')) args.push('--ignore-certificate-errors')
+
+    let executablePath: string | undefined
+    if (findChrome) {
+      try {
+        executablePath = findChrome()
+      } catch {
+        executablePath = undefined
+      }
+    }
+    if (!executablePath) {
+      const puppeteerFull = loadOptionalModule('puppeteer')
+      try {
+        executablePath = puppeteerFull?.executablePath?.()
+      } catch {}
+    }
+
+    this.log?.(`专用浏览器启动中 (代理: ${proxyServer || '未启用'})...`)
+    const browser = await puppeteerCore.launch({ executablePath, headless: true, args })
+    this.browser = browser
+    browser.once('disconnected', () => {
+      this.browser = null
+      this.pageCount = 0
+    })
+    this.log?.(`专用浏览器已启动 (进程 pid=${browser.process()?.pid ?? '?'})`)
+    // 周期性清理残留 profile：实测单个 profile 会因页面缓存视频流膨胀到 200MB+
+    if (this.gcTimer) clearInterval(this.gcTimer)
+    this.gcTimer = setInterval(() => {
+      cleanupChromeProfiles(this.log)
+    }, 5 * Time.minute)
+    if (typeof this.gcTimer.unref === 'function') this.gcTimer.unref()
+    return browser
+  }
+
+  ensure(): Promise<any> {
+    if (this.browser && this.browser.connected) return Promise.resolve(this.browser)
+    if (!this.pending) {
+      this.pending = this.launch().then((browser) => {
+        this.pending = null
+        return browser
+      }, (error) => {
+        this.pending = null
+        this.browser = null
+        throw error
+      })
+    }
+    return this.pending
+  }
+
+  touch() {
+    if (this.idleTimer) clearTimeout(this.idleTimer)
+    this.idleTimer = setTimeout(() => {
+      this.idleTimer = null
+      this.close('空闲超时')
+    }, BROWSER_IDLE_MS)
+    if (typeof this.idleTimer.unref === 'function') this.idleTimer.unref()
+  }
+
+  acquire(): Promise<void> {
+    if (this.activePages < BROWSER_MAX_PAGES) {
+      this.activePages++
+      return Promise.resolve()
+    }
+    return new Promise<void>((resolve, reject) => this.pageQueue.push({ resolve, reject }))
+  }
+
+  release() {
+    const next = this.pageQueue.shift()
+    if (next) {
+      next.resolve()
+      return
+    }
+    this.activePages = Math.max(0, this.activePages - 1)
+    if (this.activePages === 0 && this.pageCount === 0 && this.browser) this.touch()
+  }
+
+  async page(): Promise<any> {
+    await this.acquire()
+    let page: any = null
+    try {
+      const browser = await this.ensure()
+      page = await browser.newPage()
+      this.pageCount++
+      if (this.auth) await page.authenticate(this.auth)
+    } catch (error) {
+      this.release()
+      throw error
+    }
+    let released = false
+    const releaseOnce = () => {
+      if (released) return
+      released = true
+      this.pageCount = Math.max(0, this.pageCount - 1)
+      this.release()
+    }
+    page.once('close', releaseOnce)
+    // 页面持有超时：防止异常路径把页面/浏览器永久占住
+    const holdMs = 3 * Time.minute
+    const holdTimer = setTimeout(() => {
+      this.log?.(`页面持有超时 (${holdMs / 1000}s)，强制关闭以释放浏览器。`, true)
+      page.close().catch(() => releaseOnce())
+    }, holdMs)
+    if (typeof holdTimer.unref === 'function') holdTimer.unref()
+    page.once('close', () => clearTimeout(holdTimer))
+    return page
+  }
+
+  facade(): PageProvider {
+    return { page: () => this.page() }
+  }
+
+  async close(reason?: string) {
+    const browser = this.browser
+    this.browser = null
+    this.pageCount = 0
+    this.activePages = 0
+    if (this.idleTimer) {
+      clearTimeout(this.idleTimer)
+      this.idleTimer = null
+    }
+    if (this.gcTimer) {
+      clearInterval(this.gcTimer)
+      this.gcTimer = null
+    }
+    const waiting = this.pageQueue.splice(0)
+    for (const item of waiting) {
+      try {
+        item.reject(new Error('浏览器已关闭，请重试'))
+      } catch {}
+    }
+    if (!browser) return
+    this.log?.(`专用浏览器关闭中 (${reason || '手动'})...`)
+    try {
+      await browser.close()
+    } catch {}
+    await cleanupChromeProfiles(this.log)
+  }
+}
+
+async function cleanupChromeProfiles(log?: (message: string, isWarning?: boolean) => void) {
+  try {
+    const dir = tmpdir()
+    const dirs = await fs.readdir(dir)
+    let removed = 0
+    for (const name of dirs) {
+      if (!/^puppeteer_dev_chrome_(profile|pipe)-/.test(name)) continue
+      const full = join(dir, name)
+      try {
+        const stat = await fs.stat(full)
+        // 保护期 3 分钟内的不动，避免误删正在使用的 profile
+        if (Date.now() - stat.mtimeMs < 3 * 60 * 1000) continue
+        await fs.rm(full, { recursive: true, force: true, maxRetries: 2 })
+        removed++
+      } catch {}
+    }
+    if (removed > 0) log?.(`已清理 ${removed} 个残留的 chromium 临时目录。`)
+  } catch {}
 }
 
 function createKoishiFetch(ctx: Context): typeof fetch {
@@ -490,7 +796,7 @@ function extractGoogleTranslatedText(response: any): string | null {
   return translatedText || null
 }
 
-async function translateTextWithGoogle(ctx: Context, text: string, targetLang: string, log?: (message: string) => void): Promise<string | null> {
+async function translateTextWithGoogle(ctx: Context, text: string, targetLang: string, log?: (message: string) => void, proxyUrl?: string): Promise<string | null> {
   if (!text) return null
   const chunks = splitTextForTranslation(text)
   const url = `${GOOGLE_TRANSLATE_URL}?client=gtx&sl=auto&tl=${encodeURIComponent(targetLang)}&dt=t&ie=UTF-8&oe=UTF-8`
@@ -508,6 +814,7 @@ async function translateTextWithGoogle(ctx: Context, text: string, targetLang: s
         },
         responseType: 'text',
         timeout: 15000,
+        ...proxyHttpOptions(proxyUrl),
       }))
       const translatedText = extractGoogleTranslatedText(response)
       if (!translatedText) {
@@ -571,8 +878,159 @@ function isSameLanguage(sourceLanguage?: string, targetLanguage?: string) {
   return !!source && !!target && source === target
 }
 
+const TRANS_TARGET_MAP: Record<string, string> = {
+  'zh-CN': 'zh-CN',
+  'zh-TW': 'zh-TW',
+  en: 'en',
+  ja: 'ja',
+  ko: 'ko',
+  ru: 'ru',
+  fr: 'fr',
+  de: 'de',
+}
+
+function buildTranslationLabel(source: TranslationResult['source'], targetLang: string) {
+  if (source === 'translator') return `【翻译 (${targetLang})】`
+  if (source === 'chatluna') return `【ChatLuna 翻译 (${targetLang})】`
+  return `【谷歌翻译 (${targetLang})】`
+}
+
+let TRANS_API_COOLDOWN_UNTIL = 0
+
+function isMediaTweet(tweet: any) {
+  if (!tweet || typeof tweet !== 'object') return false
+  const media = tweet.entities && tweet.entities.media
+  if (Array.isArray(media) && media.length > 0) return true
+  const extended = tweet.extended_entities && tweet.extended_entities.media
+  return Array.isArray(extended) && extended.length > 0
+}
+
+/**
+ * 订阅推送的目标群计算：targetGroupId 有值时只推该群（测试命令的语义），否则推该订阅的所有群。
+ * 统一转字符串比较，因为控制台里的 groupIds 多为字符串，而 session.guildId 可能是数字。
+ */
+function targetGroupKeys(groupIds: string[] | undefined, targetGroupId?: string | null) {
+  const keys = (Array.isArray(groupIds) ? groupIds : []).map(String)
+  if (targetGroupId === null || targetGroupId === undefined || targetGroupId === '') return keys
+  const want = String(targetGroupId)
+  return keys.includes(want) ? [want] : []
+}
+
+/**
+ * syndication 端点的兜底取数。该端点返回的其实是 Top(热门)榜而不是时间线：
+ * entries 顺序与时间无关（置顶帖、几年前的热门帖混在一起），pageProps.latest_tweet_id
+ * 也等于 entries[0]，账号真正的最新推文根本不在响应里。
+ * 所以既不能取 entries[0]，也不能用 latest_tweet_id，只能：
+ *   1) 遍历全部 entries 取 created_at 最新的一条；
+ *   2) 仅当它落在 7 天内才采用，否则判定“无更新”，避免把旧热帖当新推文推送（并污染 last_tweet_url 导致漏推）。
+ */
+async function getLatestTweetUrlByApi(
+  ctx: Context,
+  username: string,
+  excludeRetweets: boolean,
+  filterMode: TweetFilterMode,
+  log?: (message: string, isWarning?: boolean) => void,
+  proxyUrl?: string,
+): Promise<string | null> {
+  const now = Date.now()
+  if (now < TRANS_API_COOLDOWN_UNTIL) {
+    log?.(`syndication API 处于限流冷却中（剩余 ${Math.ceil((TRANS_API_COOLDOWN_UNTIL - now) / 1000)}s），直接使用浏览器方式。`, true)
+    return null
+  }
+
+  const url = `https://syndication.twitter.com/srv/timeline-profile/screen-name/${encodeURIComponent(username)}`
+  log?.(`通过 syndication timeline API 获取 @${username} 最新推文...`)
+  const http = ctx.http.extend({ headers: { 'User-Agent': 'Koishi-Twitter-Fetcher' } })
+
+  let html: any
+  try {
+    html = await http.get(url, { responseType: 'text', ...proxyHttpOptions(proxyUrl) })
+  } catch (error) {
+    const status = error?.response?.status
+    if (status === 429 || /Too Many Requests/i.test((error && error.message) || '')) {
+      TRANS_API_COOLDOWN_UNTIL = Date.now() + 10 * 60 * 1000
+      log?.(`syndication API 触发限流(429)，10 分钟内不再尝试，改用浏览器方式。`, true)
+      return null
+    }
+    throw error
+  }
+
+  if (typeof html !== 'string') {
+    log?.('syndication 返回内容不是文本，无法解析。', true)
+    return null
+  }
+  const match = html.match(/<script id="__NEXT_DATA__" type="application\/json">([\s\S]*?)<\/script>/)
+  if (!match) {
+    log?.('syndication 页面中未找到 __NEXT_DATA__。', true)
+    return null
+  }
+  let data: any
+  try {
+    data = JSON.parse(match[1])
+  } catch {
+    log?.('__NEXT_DATA__ JSON 解析失败。', true)
+    return null
+  }
+  const entries = data?.props?.pageProps?.timeline?.entries
+  if (!Array.isArray(entries)) {
+    log?.('timeline entries 结构异常。', true)
+    return null
+  }
+
+  const API_FALLBACK_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000
+  let best: { id: string, ts: number, hasMedia: boolean } | null = null
+  for (const entry of entries) {
+    const tweet = entry?.content?.tweet
+    if (!tweet) continue
+    const id = tweet.conversation_id_str || (tweet.id_str ? String(tweet.id_str) : null)
+    if (!id) continue
+    const ts = Date.parse(tweet.created_at || '')
+    if (!Number.isFinite(ts)) continue
+    const hasMedia = isMediaTweet(tweet)
+    if (filterMode === 'mediaOnly' && !hasMedia) continue
+    if (filterMode === 'textOnly' && hasMedia) continue
+    if (!best || ts > best.ts) best = { id, ts, hasMedia }
+  }
+  if (!best) {
+    log?.(`API 兜底: ${entries.length} 条热门时间线中没有可用的推文（筛选: ${filterMode}）。`, true)
+    return null
+  }
+  const ageMs = Date.now() - best.ts
+  if (ageMs > API_FALLBACK_MAX_AGE_MS) {
+    log?.(`API 兜底: 热门榜中最新一条也已 ${Math.round(ageMs / 86400000)} 天前 (${new Date(best.ts).toISOString()}), 判定为无更新。`, true)
+    return null
+  }
+  const link = `https://x.com/${username}/status/${best.id}`
+  log?.(`API 兜底命中较新推文 (${new Date(best.ts).toISOString()}, 筛选: ${filterMode}, 含媒体: ${best.hasMedia}): ${link}`)
+  return link
+}
+
+/**
+ * 订阅取数编排：浏览器优先，仅在浏览器彻底失败时才用受限的 API 兜底。
+ * 浏览器是唯一能给出“账号真正最新推文”的来源（见 getLatestTweetUrlByApi 注释）。
+ */
+async function getLatestTweetUrl(
+  ctx: Context,
+  puppeteer: PageProvider,
+  username: string,
+  cookie: string | undefined,
+  excludeRetweets: boolean,
+  filterMode: TweetFilterMode,
+  log?: (message: string, isWarning?: boolean) => void,
+  proxyUrl?: string,
+): Promise<string | null> {
+  try {
+    const viaBrowser = await getLatestTweetUrlByPuppeteer(puppeteer, username, cookie, excludeRetweets, filterMode, log)
+    if (viaBrowser) return viaBrowser
+    log?.('浏览器方式未取到推文，尝试 API 兜底。', true)
+  } catch (error) {
+    log?.(`浏览器方式失败，尝试 API 兜底: ${(error as Error)?.message}`, true)
+  }
+  return await getLatestTweetUrlByApi(ctx, username, excludeRetweets, filterMode, log, proxyUrl)
+}
+
 async function getLatestTweetUrlByPuppeteer(
-  puppeteer: Puppeteer,
+  puppeteer: PageProvider,
   username: string,
   cookie: string | undefined,
   excludeRetweets: boolean,
@@ -583,8 +1041,7 @@ async function getLatestTweetUrlByPuppeteer(
   const page = await puppeteer.page()
   try {
     if (cookie) await page.setCookie({ name: 'auth_token', value: cookie, domain: '.x.com', path: '/', httpOnly: true, secure: true })
-    await page.goto(`https://x.com/${username}`, { waitUntil: 'networkidle2', timeout: 30000 })
-    await page.waitForSelector('article[data-testid="tweet"]', { timeout: 20000 })
+    await loadTweetPage(page, `https://x.com/${username}`, { log })
 
     const latestTweetUrl = await page.evaluate((excludeRetweets, filterMode) => {
       const articles = document.querySelectorAll('article[data-testid="tweet"]')
@@ -620,13 +1077,13 @@ async function getLatestTweetUrlByPuppeteer(
   }
 }
 
-async function getTweetScreenshot(puppeteer: Puppeteer, url: string, cookie?: string, log?: (message: string) => void): Promise<Buffer> {
+async function getTweetScreenshot(puppeteer: PageProvider, url: string, cookie?: string, log?: (message: string) => void): Promise<Buffer> {
   const page = await puppeteer.page()
   try {
     log?.(`准备截图页面: ${url}`)
     if (cookie) await page.setCookie({ name: 'auth_token', value: cookie, domain: '.x.com', path: '/', httpOnly: true, secure: true })
-    await page.goto(url, { waitUntil: 'networkidle2', timeout: 20000 })
-    const tweetElement = await page.waitForSelector('article[data-testid="tweet"]', { timeout: 15000 })
+    const loaded = await loadTweetPage(page, url, { waitMs: 40000, gotoMs: 45000, log })
+    const tweetElement = loaded ? await page.$('article[data-testid="tweet"]') : null
     if (!tweetElement) throw new Error('无法在页面上定位到推文元素.')
     log?.('定位到推文元素, 正在生成截图...')
     return await tweetElement.screenshot()
@@ -635,11 +1092,18 @@ async function getTweetScreenshot(puppeteer: Puppeteer, url: string, cookie?: st
   }
 }
 
-async function getTweetDataByApi(ctx: Context, tweetUrl: string, useOriginal: boolean, provider: ApiProvider, log?: (message: string) => void): Promise<TweetData> {
+async function fetchTweetFromProvider(
+  ctx: Context,
+  tweetUrl: string,
+  useOriginal: boolean,
+  provider: ApiProvider,
+  log?: (message: string, isWarning?: boolean) => void,
+  proxyUrl?: string,
+): Promise<TweetData> {
   const apiUrl = buildTweetApiUrl(tweetUrl, provider === 'fxtwitter' ? 'api.fxtwitter.com' : 'api.vxtwitter.com')
   log?.(`使用 ${provider} API 进行解析: ${apiUrl}`)
   const http = ctx.http.extend({ headers: { 'User-Agent': 'Koishi-Twitter-Fetcher' } })
-  const apiResponse = parseJsonResponse(await http.get(apiUrl, { responseType: 'text' }))
+  const apiResponse = parseJsonResponse(await http.get(apiUrl, { responseType: 'text', ...proxyHttpOptions(proxyUrl) }))
   log?.(`成功接收到 ${provider} API 的响应.`)
 
   if (provider === 'fxtwitter') {
@@ -682,16 +1146,48 @@ async function getTweetDataByApi(ctx: Context, tweetUrl: string, useOriginal: bo
   }
 }
 
-async function getTweetDataByBrowser(puppeteer: Puppeteer, tweetUrl: string, cookie: string | undefined, useOriginal: boolean, log?: (message: string, isWarning?: boolean) => void): Promise<TweetData> {
+/**
+ * 主用 provider 失败时自动回退到另一个，避免单点偶发超时（实测出现过 Connect Timeout 10s）导致整条解析失败。
+ */
+async function getTweetDataByApi(
+  ctx: Context,
+  tweetUrl: string,
+  useOriginal: boolean,
+  provider: ApiProvider,
+  log?: (message: string, isWarning?: boolean) => void,
+  proxyUrl?: string,
+): Promise<TweetData> {
+  const order: ApiProvider[] = provider === 'fxtwitter' ? ['fxtwitter', 'vxtwitter'] : ['vxtwitter', 'fxtwitter']
+  let lastError: any = null
+  for (let i = 0; i < order.length; i++) {
+    const current = order[i]
+    try {
+      const data = await fetchTweetFromProvider(ctx, tweetUrl, useOriginal, current, log, proxyUrl)
+      // 文本与媒体都为空时视为该源没取到内容，继续尝试下一个
+      if (data && (data.text || (data.media && data.media.length > 0))) return data
+      log?.(`${current} 返回内容为空。`, true)
+    } catch (error) {
+      lastError = error
+      log?.(`${current} 解析失败: ${(error as Error)?.message}`, true)
+    }
+    if (i < order.length - 1) log?.(`回退到 ${order[i + 1]} API 重试...`, true)
+  }
+  if (lastError) throw lastError
+  return null
+}
+
+async function getTweetDataByBrowser(puppeteer: PageProvider, tweetUrl: string, cookie: string | undefined, useOriginal: boolean, log?: (message: string, isWarning?: boolean) => void): Promise<TweetData> {
   const page = await puppeteer.page()
   const captured = new Map<string, TweetMedia>()
   const addMedia = (url: string, type?: MediaType) => {
     url = sanitizeMediaUrl(url)
     if (!url || url.startsWith('blob:') || url.startsWith('data:')) return
     if (!/pbs\.twimg\.com|video\.twimg\.com/i.test(url)) return
-    const mediaType = type || inferMediaType(url)
+    let mediaType = type || inferMediaType(url)
+    if (getVideoId(url)) mediaType = 'video'
     const normalized = mediaType === 'image' ? normalizeTwitterImageUrl(url, useOriginal) : url
     const key = getMediaKey(normalized)
+    if (!key) return
     if (!captured.has(key)) captured.set(key, { url: normalized, type: mediaType })
   }
 
@@ -705,8 +1201,7 @@ async function getTweetDataByBrowser(puppeteer: Puppeteer, tweetUrl: string, coo
 
   try {
     if (cookie) await page.setCookie({ name: 'auth_token', value: cookie, domain: '.x.com', path: '/', httpOnly: true, secure: true })
-    await page.goto(tweetUrl, { waitUntil: 'networkidle2', timeout: 30000 })
-    await page.waitForSelector('article[data-testid="tweet"]', { timeout: 20000 })
+    await loadTweetPage(page, tweetUrl, { log })
     const tweetId = extractTweetId(tweetUrl)
 
     const data = await page.evaluate((targetTweetId) => {
@@ -788,7 +1283,8 @@ async function getTweetDataByBrowser(puppeteer: Puppeteer, tweetUrl: string, coo
         const url = sanitizeMediaUrl(candidate)
         const mediaType = inferMediaType(url)
         const normalized = mediaType === 'image' ? normalizeTwitterImageUrl(url, useOriginal) : url
-        domKeys.add(getMediaKey(normalized))
+        const key = getMediaKey(normalized)
+        if (key) domKeys.add(key)
         addMedia(url, mediaType)
       }
     }
@@ -859,6 +1355,44 @@ export function apply(ctx: Context, config: Config) {
       }
     }
   }
+
+  // ---- 代理 / 专用浏览器（只影响本插件，不碰共享的 ctx.puppeteer） ----
+  const tfProxyUrl = config.isProxy && config.proxyHost ? config.proxyHost : ''
+  const maxVideoBytes = typeof config.maxVideoMB === 'number' && config.maxVideoMB > 0 ? config.maxVideoMB * 1024 * 1024 : 0
+  const getTranslator = (): any => {
+    try {
+      return (ctx as any).get('translator') || null
+    } catch {
+      return null
+    }
+  }
+
+  let tfProxyAuth: { username: string, password: string } | null = null
+  if (tfProxyUrl) {
+    try {
+      const proxyUrl = new URL(tfProxyUrl)
+      if (proxyUrl.username) {
+        tfProxyAuth = {
+          username: decodeURIComponent(proxyUrl.username),
+          password: decodeURIComponent(proxyUrl.password || ''),
+        }
+      }
+    } catch {
+      logger.warn(`代理地址解析失败，将按无认证处理: ${tfProxyUrl}`)
+    }
+  }
+
+  const browserManager = new BrowserManager(tfProxyUrl, tfProxyAuth, (message, isWarning) => {
+    if (isWarning) logger.warn(`[代理] ${message}`)
+    else if (config.logDetails) logger.info(`[代理] ${message}`)
+  })
+  const getBrowser = (): PageProvider => tfProxyUrl ? browserManager.facade() : ctx.puppeteer
+  if (tfProxyUrl) {
+    logger.info(`已启用代理: ${browserManager.urlWithoutAuth()}${tfProxyAuth ? ' (含认证)' : ''}，仅本插件的浏览器与请求走代理。`)
+  }
+  ctx.on('dispose', () => {
+    browserManager.close('插件卸载')
+  })
 
   async function getHashtagScraper() {
     if (hashtagScraper) return hashtagScraper
@@ -986,11 +1520,31 @@ export function apply(ctx: Context, config: Config) {
     }
   }
 
-  async function translateText(text: string, targetLang: string, log?: (message: string) => void) {
+  async function translateText(text: string, targetLang: string, log?: (message: string, isWarning?: boolean) => void): Promise<TranslationResult | null> {
+    if (!text) return null
+    const target = TRANS_TARGET_MAP[targetLang] || targetLang
+    const translator = getTranslator()
+
+    // 显式选择 ChatLuna 模型时优先调用模型；默认（谷歌）路径下，若装了 chatluna-translator 服务则先用它
     if (config.translationProvider === 'chatluna') {
-      return translateTextWithChatLuna(text, targetLang, log)
+      const viaModel = await translateTextWithChatLuna(text, targetLang, log)
+      if (viaModel) return { text: viaModel, source: 'chatluna' }
+    } else if (translator && typeof translator.translate === 'function') {
+      try {
+        log?.(`调用 chatluna-translator (LLM) 翻译...`)
+        const translated = await translator.translate({ input: text, from: 'auto', target })
+        if (translated && String(translated).trim()) {
+          log?.(`LLM 翻译成功, 目标语言: ${targetLang}.`)
+          return { text: String(translated).trim(), source: 'translator' }
+        }
+        log?.(`LLM 翻译返回空内容，回退谷歌翻译。`, true)
+      } catch (error) {
+        log?.(`LLM 翻译失败，回退谷歌翻译: ${(error as Error)?.message}`, true)
+      }
     }
-    return translateTextWithGoogle(ctx, text, targetLang, log)
+
+    const viaGoogle = await translateTextWithGoogle(ctx, text, targetLang, log, tfProxyUrl)
+    return viaGoogle ? { text: viaGoogle, source: 'google' } : null
   }
 
   async function getTempDir() {
@@ -1008,9 +1562,46 @@ export function apply(ctx: Context, config: Config) {
     return fs.unlink(path).catch(() => {})
   }
 
+  async function fetchFileViaProxy(http: any, url: string, options?: any) {
+    if (!options || !options.proxyAgent) {
+      return await http.file(url, options || {})
+    }
+    // 注意：Koishi 的 http.file() 内部只透传 timeout，会丢弃 proxyAgent，
+    // 导致媒体下载直连 twimg 而失败（实测 1 秒内 ERR），故这里绕过 file() 自行拼返回值。
+    const result = await http(url, {
+      method: 'GET',
+      responseType: 'arraybuffer',
+      timeout: +((options && options.timeout) || 0) || undefined,
+      proxyAgent: options.proxyAgent,
+    })
+    const type = result.headers.get('content-type')
+    const match = result.url && result.url.match(/.+\/([^/?]*)(?=\?)?/)
+    return { type, mime: type, filename: match ? match[1] : undefined, data: result.data }
+  }
+
+  async function probeRemoteSize(url: string): Promise<number | null> {
+    try {
+      const http = ctx.http.extend({ headers: { 'User-Agent': 'Koishi-Twitter-Fetcher', 'Referer': 'https://x.com/' } })
+      const res = await http(url, {
+        method: 'GET',
+        headers: { Range: 'bytes=0-0' },
+        responseType: 'text',
+        timeout: 20000,
+        ...proxyHttpOptions(tfProxyUrl),
+      })
+      const range = res.headers.get('content-range')
+      const match = range && range.match(/\/(\d+)\s*$/)
+      if (match) return Number(match[1])
+      const len = res.headers.get('content-length')
+      return len ? Number(len) : null
+    } catch {
+      return null
+    }
+  }
+
   async function downloadToTemp(url: string, mimeHint?: string) {
     const http = ctx.http.extend({ headers: { 'User-Agent': 'Koishi-Twitter-Fetcher', 'Referer': 'https://x.com/' } })
-    const file = await http.file(url)
+    const file = await fetchFileViaProxy(http, url, proxyHttpOptions(tfProxyUrl))
     const mime = file.mime || mimeHint || 'application/octet-stream'
     const ext = mimeToExtension(mime) || extname(new URL(url).pathname) || '.bin'
     const path = join(await getTempDir(), `${Date.now()}-${randomUUID()}${ext}`)
@@ -1023,6 +1614,22 @@ export function apply(ctx: Context, config: Config) {
     const configuredMode = type === 'image' ? config.imageTransferMode : config.videoTransferMode
     let mode = configuredMode
     let sourceUrl = media.url
+    // 开代理时 url 传递方式会绕过代理直连 twimg（国内不通），自动改为 buffer
+    if (tfProxyUrl && mode === 'url') {
+      log?.('已启用代理，url 传递方式会绕过代理直连 twimg，自动改为 buffer 由本机代理下载后发送。', true)
+      mode = 'buffer'
+    }
+    if (type === 'video' && config.skipVideo) {
+      log?.('已按配置跳过视频（避免大体积 base64 经 WebSocket 灌给 NapCat 导致其卡死）。', true)
+      return null
+    }
+    if (type === 'video' && mode !== 'url' && maxVideoBytes > 0) {
+      const size = await probeRemoteSize(sourceUrl)
+      if (size && size > maxVideoBytes) {
+        log?.(`视频体积 ${(size / 1048576).toFixed(1)}MB 超过上限 ${(maxVideoBytes / 1048576).toFixed(1)}MB，已跳过（避免下载与发送超时；可在配置中调整「视频体积上限」或设为 0 关闭限制）。`, true)
+        return null
+      }
+    }
     let tempInput: string | null = null
     let tempOutput: string | null = null
     let data: Buffer | null = null
@@ -1087,8 +1694,8 @@ export function apply(ctx: Context, config: Config) {
   async function loadTweetData(tweetUrl: string, useOriginal: boolean, log?: (message: string, isWarning?: boolean) => void): Promise<TweetData> {
     const needApi = config.tweetFetchMode === 'api' || config.mediaFetchMode === 'api'
     const needBrowser = config.tweetFetchMode === 'browser' || config.mediaFetchMode === 'browser'
-    const apiData = needApi ? await getTweetDataByApi(ctx, tweetUrl, useOriginal, config.apiProvider, log) : null
-    const browserData = needBrowser ? await getTweetDataByBrowser(ctx.puppeteer, tweetUrl, config.cookie, useOriginal, log) : null
+    const apiData = needApi ? await getTweetDataByApi(ctx, tweetUrl, useOriginal, config.apiProvider, log, config.proxyApi ? tfProxyUrl : '') : null
+    const browserData = needBrowser ? await getTweetDataByBrowser(getBrowser(), tweetUrl, config.cookie, useOriginal, log) : null
     const textSource = config.tweetFetchMode === 'browser' ? browserData : apiData
     const mediaSource = config.mediaFetchMode === 'browser' ? browserData : apiData
 
@@ -1099,6 +1706,16 @@ export function apply(ctx: Context, config: Config) {
       language: textSource?.language,
       media: mediaSource?.media || [],
     }
+  }
+
+  // 合并转发若因媒体被平台拦截而投递失败, 降级为纯文本时追加在末尾的说明.
+  // 实测个别推文的媒体会被平台拒绝投递, 导致整条合并转发失败.
+  const MEDIA_DROPPED_NOTICE = '⚠️ 媒体发送失败（可能因文件过大或平台审核），已省略。'
+
+  // 构造降级用的正文: 有媒体被丢弃时 = 原文 + 说明; 没有媒体则返回空串(内容相同, 无需降级).
+  function buildFallbackForwardBody(textBody: string, mediaCount: number) {
+    if (!(mediaCount > 0)) return ''
+    return [(textBody || '').trim(), MEDIA_DROPPED_NOTICE].filter(Boolean).join('\n\n')
   }
 
   async function processTweet(
@@ -1130,7 +1747,7 @@ export function apply(ctx: Context, config: Config) {
     if (options.showScreenshot) {
       log('开始获取推文截图.')
       try {
-        const screenshotBuffer = await getTweetScreenshot(ctx.puppeteer, tweetUrl, config.cookie, log)
+        const screenshotBuffer = await getTweetScreenshot(getBrowser(), tweetUrl, config.cookie, log)
         if (screenshotBuffer) {
           screenshotElement = h.image(screenshotBuffer, 'image/png')
           log('截图成功并准备好 h.image 元素 (Buffer 模式).')
@@ -1151,10 +1768,12 @@ export function apply(ctx: Context, config: Config) {
             log(`原文语言 ${tweetData.language} 与目标语言 ${options.targetLang} 相同，已跳过翻译.`)
           } else {
             log('检测到翻译已开启.')
-            const translatedText = await translateText(tweetData.text, options.targetLang, log)
-            const translationName = config.translationProvider === 'chatluna' ? 'ChatLuna 翻译' : '谷歌翻译'
-            if (translatedText) textParts.push(`\n【${translationName} (${options.targetLang})】:\n${translatedText}`)
-            else log('翻译失败或返回空内容.', true)
+            const translation = await translateText(tweetData.text, options.targetLang, log)
+            if (translation && translation.text) {
+              textParts.push(`\n${buildTranslationLabel(translation.source, options.targetLang)}:\n${translation.text}`)
+            } else {
+              log('翻译失败或返回空内容.', true)
+            }
           }
         }
       }
@@ -1190,8 +1809,21 @@ export function apply(ctx: Context, config: Config) {
       }
 
       if (options.useForward && options.platform === 'onebot') {
-        const forwardElements: (h | string)[] = [textParts.join('\n'), ...mediaParts].filter(Boolean)
-        return { main: h('figure', {}, forwardElements), media: [] }
+        // 合并转发里每个媒体必须各自成为一个节点(node)：
+        // adapter-onebot 的 flush() 在 type==="forward" 时会把当前累积的 children 一次性打包成【一个】node，
+        // 所以 h("figure", {}, [文本, gif1, gif2, gif3, gif4]) 实际只生成一个 node，
+        // QQ 安卓对“单节点多条媒体”只能点开第一张。用 <message> 包裹后每个媒体切分成独立 node，逐个可点。
+        const forwardNodes: (h | string)[] = []
+        const textBody = textParts.join('\n')
+        if (textBody) forwardNodes.push(h('message', {}, [textBody]))
+        for (const part of mediaParts) forwardNodes.push(h('message', {}, [part]))
+        const fallbackBody = buildFallbackForwardBody(textBody, mediaParts.length)
+        return {
+          main: h('figure', {}, forwardNodes),
+          fallbackText: fallbackBody ? h('figure', {}, [h('message', {}, [fallbackBody])]) : undefined,
+          droppedMediaCount: mediaParts.length,
+          media: [],
+        }
       }
       const finalParts: (string | h)[] = [textParts.join('\n'), ...mediaParts].filter(Boolean)
       return { main: finalParts.join('\n\n'), media: [] }
@@ -1202,7 +1834,22 @@ export function apply(ctx: Context, config: Config) {
   }
 
   async function sendProcessedTweet(send: (message: string | h) => Promise<any>, result: ProcessedTweet) {
-    if (result.main) await send(result.main)
+    if (result.main) {
+      try {
+        await send(result.main)
+      } catch (error) {
+        if (!result.fallbackText) throw error
+        // Timeout 类错误不能降级重发：合并转发带大媒体时 NapCat 侧 60s 内没返回，
+        // 但消息往往【已经投递成功】。实测超时后群里仍收到了带视频的合并转发，
+        // 此时的降级重发又发了一条纯文本 —— 同一条推文在群里出现两次。
+        if (/timeout/i.test((error as Error)?.message || '')) {
+          logger.warn(`[!] 合并转发发送超时，消息可能已投递，为避免重复不再降级重发: ${(error as Error)?.message}`)
+          return
+        }
+        logger.warn(`[!] 合并转发发送失败，改为纯文本重试(丢弃 ${result.droppedMediaCount || 0} 项媒体): ${(error as Error)?.message}`)
+        await send(result.fallbackText)
+      }
+    }
     for (const media of result.media) await send(media)
   }
 
@@ -1228,7 +1875,7 @@ export function apply(ctx: Context, config: Config) {
       targetLang: config.parse_targetLang,
     })
 
-    await sendProcessedTweet(message => session.send(message), messageToSend)
+    await sendProcessedTweet(message => session.bot.sendMessage(session.channelId, message), messageToSend)
     if (statusMessage) await session.bot.deleteMessage(session.channelId, statusMessage[0])
   })
 
@@ -1404,7 +2051,7 @@ export function apply(ctx: Context, config: Config) {
     return pushedPosts
   }
 
-  async function performSubscriptionCheck(isManualTrigger = false) {
+  async function performSubscriptionCheck(isManualTrigger = false, targetGroupId: string | null = null) {
     if (!config.enableSubscription) return
 
     if (config.logDetails) logger.info('[订阅] 开始新一轮更新检查...')
@@ -1419,6 +2066,9 @@ export function apply(ctx: Context, config: Config) {
     let updatesFound = 0
     for (const sub of config.subscriptions) {
       if (!sub.username || !sub.groupIds || sub.groupIds.length === 0) continue
+      // 推送目标：测试命令只影响当前群，定时检查推所有群。空数组表示本群未被该订阅覆盖，跳过。
+      const targets = targetGroupKeys(sub.groupIds, targetGroupId)
+      if (targets.length === 0) continue
 
       const log = createLogStepper(`订阅:${sub.username}`)
       log('开始处理此用户的订阅.')
@@ -1426,7 +2076,7 @@ export function apply(ctx: Context, config: Config) {
       try {
         const excludeRetweets = sub.excludeRetweets ?? true
         const tweetFilterMode: TweetFilterMode = sub.tweetFilterMode ?? 'all'
-        const latestTweetUrl = await getLatestTweetUrlByPuppeteer(ctx.puppeteer, sub.username, config.cookie, excludeRetweets, tweetFilterMode, log)
+        const latestTweetUrl = await getLatestTweetUrl(ctx, getBrowser(), sub.username, config.cookie, excludeRetweets, tweetFilterMode, log, tfProxyUrl)
 
         if (!latestTweetUrl) {
           log('未能获取到最新推文链接, 跳过.', true)
@@ -1457,7 +2107,8 @@ export function apply(ctx: Context, config: Config) {
 
             let successfulGroups = 0
             let failedGroups = 0
-            for (const groupId of sub.groupIds) {
+            // 只推 targets（测试时即当前群）
+            for (const groupId of targets) {
               try {
                 await sendProcessedTweet(message => bot.sendMessage(groupId, message), messageToSend)
                 successfulGroups++
@@ -1466,7 +2117,8 @@ export function apply(ctx: Context, config: Config) {
                 logger.warn(`[订阅] 向群 [${groupId}] 推送 [${sub.username}] 的推文失败:`, error)
               }
             }
-            if (isNew && successfulGroups > 0) {
+            // 手动测试不写库，避免把测试推送当成“已推送”而让正式检查漏掉这条推文
+            if (isNew && !isManualTrigger && successfulGroups > 0) {
               await ctx.database.upsert('twitter_subscriptions', [{ id: sub.username, last_tweet_url: latestTweetUrl }])
               log(`已有 ${successfulGroups} 个群推送成功，已记录最新推文状态。`)
             }
@@ -1484,24 +2136,27 @@ export function apply(ctx: Context, config: Config) {
       await sleep(3 * Time.second)
     }
 
-    try {
-      updatesFound += await checkAndPushHashtagUpdates(bot)
-    } catch (error) {
-      logger.warn('[话题订阅] 本轮检查发生错误，用户订阅结果不受影响:', error)
+    // 手动测试只推当前群，不应顺带把话题订阅推给所有群
+    if (!isManualTrigger) {
+      try {
+        updatesFound += await checkAndPushHashtagUpdates(bot)
+      } catch (error) {
+        logger.warn('[话题订阅] 本轮检查发生错误，用户订阅结果不受影响:', error)
+      }
     }
 
     if (config.logDetails) logger.info(`[订阅] 本轮更新检查结束, 共发现 ${updatesFound} 个更新.`)
-    if (isManualTrigger) return `手动检查完成, 共为 ${updatesFound} 个订阅执行了推送任务.`
+    if (isManualTrigger) return `手动检查完成, 共执行了 ${updatesFound} 个推送任务.`
   }
 
   let activeSubscriptionCheck: Promise<string | void> | null = null
 
-  async function checkAndPushUpdates(isManualTrigger = false) {
+  async function checkAndPushUpdates(isManualTrigger = false, targetGroupId: string | null = null) {
     if (activeSubscriptionCheck) {
       if (isManualTrigger) return '已有一轮订阅检查正在运行，请等待完成后再试。'
       return
     }
-    const task = performSubscriptionCheck(isManualTrigger)
+    const task = performSubscriptionCheck(isManualTrigger, targetGroupId)
     activeSubscriptionCheck = task
     try {
       return await task
@@ -1519,7 +2174,7 @@ export function apply(ctx: Context, config: Config) {
         await session.send(`正在为 [${username}] 获取最新推文并模拟推送到当前会话...`)
         const log = createLogStepper(`测试:${username}`)
         try {
-          const latestTweetUrl = await getLatestTweetUrlByPuppeteer(ctx.puppeteer, username, config.cookie, true, 'all', log)
+          const latestTweetUrl = await getLatestTweetUrl(ctx, getBrowser(), username, config.cookie, true, 'all', log, tfProxyUrl)
           if (!latestTweetUrl) return '无法找到该用户的最新推文链接(已排除转推).'
           await session.send(`成功获取到最新推文链接: ${latestTweetUrl}\n正在生成内容...`)
           const messageToSend = await processTweet(latestTweetUrl, {
@@ -1533,18 +2188,27 @@ export function apply(ctx: Context, config: Config) {
             enableTranslation: config.sub_enableTranslation,
             targetLang: config.sub_targetLang,
           })
-          await sendProcessedTweet(message => session.send(message), messageToSend)
+          await sendProcessedTweet(message => session.bot.sendMessage(session.channelId, message), messageToSend)
         } catch (error) {
           logger.warn(`[测试] 测试 [${username}] 时出错:`, error)
           return `测试失败: ${error.message}`
         }
       })
 
-    ctx.command('测试群组推送', '立即获取所有订阅的最新推文并强制推送, 用于测试')
+    ctx.command('测试群组推送', '获取本群所订阅用户的最新推文并强制推送到本群（仅影响当前群）')
       .action(async ({ session }) => {
-        session.send('正在手动触发所有订阅的强制推送任务...')
-        const result = await checkAndPushUpdates(true)
-        return result
+        // 统一成字符串比较：配置里 groupIds 通常是字符串，而 session.guildId 可能是数字
+        const raw = session.guildId ?? session.channelId
+        if (raw === null || raw === undefined || raw === '') return '请在群聊中使用本命令。'
+        const groupId = String(raw)
+        const targets = config.subscriptions.filter(
+          s => s.username && Array.isArray(s.groupIds) && s.groupIds.map(String).includes(groupId),
+        )
+        if (targets.length === 0) {
+          return `本群（${groupId}）没有被任何订阅推送。请先在控制台把 ${groupId} 加入对应订阅的 groupIds。`
+        }
+        await session.send(`正在为当前群获取 ${targets.map(s => s.username).join(', ')} 的最新推文并强制推送...`)
+        return await checkAndPushUpdates(true, groupId)
       })
 
     ctx.command('测试话题标签推送 <hashtag:string>', '获取指定话题标签的最新推文并发送到当前会话，不修改订阅水位')

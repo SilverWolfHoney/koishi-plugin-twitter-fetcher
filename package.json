@@ -1,7 +1,7 @@
 {
-  "name": "koishi-plugin-twitter-fetcher",
-  "description": "一个推特/Twitter/X内容获取与订阅插件，支持链接解析、用户订阅和话题标签订阅。",
-  "version": "2.1.2",
+  "name": "@silverwolfhoney/koishi-plugin-twitter-fetcher",
+  "description": "【非官方修改版】基于 koishi-plugin-twitter-fetcher 2.1.2：浏览器优先订阅、代理/限流、合并转发降级等补丁",
+  "version": "1.0.0",
   "main": "lib/index.js",
   "typings": "lib/index.d.ts",
   "files": [
@@ -9,18 +9,19 @@
     "dist",
     "client"
   ],
-  "author": "whitebr1ck",
+  "author": "Original: whitebr1ck <https://github.com/WhiteBr1ck/koishi-plugin-twitter-fetcher>; modifications: SilverWolfHoney <https://github.com/SilverWolfHoney>",
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/WhiteBr1ck/koishi-plugin-twitter-fetcher.git"
+    "url": "git+https://github.com/SilverWolfHoney/koishi-plugin-twitter-fetcher.git"
   },
   "bugs": {
-    "url": "https://github.com/WhiteBr1ck/koishi-plugin-twitter-fetcher/issues"
+    "url": "https://github.com/SilverWolfHoney/koishi-plugin-twitter-fetcher/issues"
   },
-  "homepage": "https://github.com/WhiteBr1ck/koishi-plugin-twitter-fetcher#readme",
+  "homepage": "https://github.com/SilverWolfHoney/koishi-plugin-twitter-fetcher#readme",
   "keywords": [
     "koishi",
+    "koishi-plugin",
     "plugin",
     "twitter",
     "x",
@@ -33,7 +34,9 @@
     "push",
     "gif",
     "ffmpeg",
-    "browser"
+    "browser",
+    "proxy",
+    "patched"
   ],
   "peerDependencies": {
     "@koishijs/plugin-console": "^5.30.0",
@@ -44,7 +47,7 @@
   },
   "koishi": {
     "description": {
-      "zh": "自动解析推特/Twitter/X链接，支持用户与话题标签订阅、浏览器原生获取、翻译、真 GIF 和多种媒体发送方式。"
+      "zh": "【非官方修改版】自动解析推特/Twitter/X链接，支持用户与话题标签订阅、浏览器原生获取、翻译、真 GIF 和多种媒体发送方式；额外修复浏览器优先取数、代理、合并转发降级等问题。"
     },
     "service": {
       "required": [
@@ -59,14 +62,20 @@
     }
   },
   "scripts": {
-    "build": "esbuild src/index.ts --bundle --platform=node --format=cjs --target=node18 --external:koishi --external:koishi-plugin-puppeteer --external:@koishijs/plugin-console --external:koishi-plugin-chatluna/* --external:@the-convocation/twitter-scraper --outfile=lib/index.js && tsc --emitDeclarationOnly",
-    "build:client": "node -e \"import('@koishijs/client/lib').then(({ build }) => build(process.cwd()))\""
+    "build": "esbuild src/index.ts --bundle --platform=node --format=cjs --target=node18 --charset=utf8 --external:koishi --external:koishi-plugin-puppeteer --external:@koishijs/plugin-console --external:koishi-plugin-chatluna/* --external:@the-convocation/twitter-scraper --external:puppeteer-core --external:puppeteer-finder --outfile=lib/index.js && tsc --emitDeclarationOnly",
+    "build:client": "node -e \"import('@koishijs/client/lib').then(({ build }) => build(process.cwd()))\"",
+    "prepublishOnly": "npm run build"
   },
   "dependencies": {
     "@the-convocation/twitter-scraper": "0.22.3"
   },
   "devDependencies": {
-    "@koishijs/client": "^5.30.4"
+    "@koishijs/client": "^5.30.4",
+    "@koishijs/plugin-console": "^5.30.0",
+    "@types/node": "^22.0.0",
+    "esbuild": "^0.28.2",
+    "typescript": "^5.9.3",
+    "yml-register": "^1.2.5"
   },
   "peerDependenciesMeta": {
     "@koishijs/plugin-console": {

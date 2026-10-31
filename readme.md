@@ -1,9 +1,19 @@
-# Koishi 插件：Twitter Fetcher
+# Koishi 插件：Twitter Fetcher（非官方修改版）
 
-[![npm](https://img.shields.io/npm/v/koishi-plugin-twitter-fetcher.svg)](https://www.npmjs.com/package/koishi-plugin-twitter-fetcher)
-[![npm](https://img.shields.io/npm/dm/koishi-plugin-twitter-fetcher.svg)](https://www.npmjs.com/package/koishi-plugin-twitter-fetcher)
+[![npm](https://img.shields.io/npm/v/@silverwolfhoney/koishi-plugin-twitter-fetcher.svg)](https://www.npmjs.com/package/@silverwolfhoney/koishi-plugin-twitter-fetcher)
+[![npm](https://img.shields.io/npm/dm/@silverwolfhoney/koishi-plugin-twitter-fetcher.svg)](https://www.npmjs.com/package/@silverwolfhoney/koishi-plugin-twitter-fetcher)
+
+> **本仓库是 [`WhiteBr1ck/koishi-plugin-twitter-fetcher`](https://github.com/WhiteBr1ck/koishi-plugin-twitter-fetcher) 的非官方修改版（基于 2.1.2）。**
+> npm 包名：`@silverwolfhoney/koishi-plugin-twitter-fetcher`
+>
+> 在上游基础上补充了：浏览器优先的订阅取数、独立代理浏览器（支持 HTTPS 自签证书代理）、
+> 浏览器资源限流与残留 profile 清理、媒体去噪与视频体积上限、合并转发失败降级（Timeout 不重发）、
+> `测试群组推送` 只推当前群等修复。
+>
+> 完整改动与背景见 [PATCHES.md](./PATCHES.md)。需要上游原版请安装 `koishi-plugin-twitter-fetcher`。
 
 一个 Twitter/X 内容获取与订阅插件。支持链接实时解析、用户订阅推送、截图、文本、图片、视频。
+
 
 ## 功能特性
 
@@ -16,10 +26,13 @@
 *   **用户与话题订阅**: 后台定时检查指定用户或 `#hashtag` 的新推文，并推送到多个群组。
 *   **右侧悬浮侧边栏**: 安装 Koishi 控制台插件后，配置页会显示可拖动的导航控件。
 *   **可选 ChatLuna 翻译**: 除 Google 翻译外，也可选择 ChatLuna 已加载的大语言模型翻译推文。
+*   **浏览器优先订阅**: 用浏览器取「账号真正的最新推文」，syndication API 仅作 7 天新鲜度限制下的兜底，避免误推置顶/热门旧帖。
+*   **独立代理浏览器**: 可只给本插件的浏览器与请求配代理（支持 HTTPS 自签证书代理与账密认证），不影响其它插件共用的 puppeteer。
+*   **合并转发降级**: 个别推文媒体被平台拒绝投递时，自动改为纯文本合并转发并在末尾说明；发送超时不会重复推送。
 
 ## 安装
 
-1.  从 Koishi 插件市场搜索并安装 `twitter-fetcher`。
+1.  从 Koishi 插件市场搜索并安装 `@silverwolfhoney/koishi-plugin-twitter-fetcher`（市场里显示为 `@silverwolfhoney/twitter-fetcher`；上游原版是 `koishi-plugin-twitter-fetcher`）。
 2.  安装并启用 `puppeteer` 和 `database` 服务。
 3.  若要使用真 GIF 模式，请安装并启用 `koishi-plugin-ffmpeg`。
 4.  若要使用 ChatLuna 模型翻译，请安装并启用 `koishi-plugin-chatluna` 以及至少一个模型适配器，并确保 ChatLuna 中已有可用模型。
