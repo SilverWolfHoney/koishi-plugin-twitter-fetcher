@@ -7,7 +7,8 @@
   "files": [
     "lib",
     "dist",
-    "client"
+    "client",
+    "PATCHES.md"
   ],
   "author": "Original: whitebr1ck <https://github.com/WhiteBr1ck/koishi-plugin-twitter-fetcher>; modifications: SilverWolfHoney <https://github.com/SilverWolfHoney>",
   "license": "MIT",
