@@ -65,7 +65,8 @@
   "scripts": {
     "build": "esbuild src/index.ts --bundle --platform=node --format=cjs --target=node18 --charset=utf8 --external:koishi --external:koishi-plugin-puppeteer --external:@koishijs/plugin-console --external:koishi-plugin-chatluna/* --external:@the-convocation/twitter-scraper --external:puppeteer-core --external:puppeteer-finder --outfile=lib/index.js && tsc --emitDeclarationOnly",
     "build:client": "node -e \"import('@koishijs/client/lib').then(({ build }) => build(process.cwd()))\"",
-    "prepublishOnly": "npm run build"
+    "prepublishOnly": "npm run build",
+    "test:patch": "node tests/verify-subscription-and-forward.js lib/index.js && node tests/verify-media-and-static.js lib/index.js"
   },
   "dependencies": {
     "@the-convocation/twitter-scraper": "0.22.3"
